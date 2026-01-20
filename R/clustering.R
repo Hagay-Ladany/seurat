@@ -1083,8 +1083,8 @@ FindNeighborsQC.Seurat <- function(
   # Enforce bounds: k_i >= 1 and k_i <= n.cells - 1
   k.per.cell <- pmin(pmax(k.per.cell, 1), n.cells - 1)
 
-  # Also enforce k.max doesn't exceed n.cells - 1
-  k.global <- min(max(k.per.cell), n.cells - 1)
+  # Compute k.global for initial neighbor search
+  k.global <- max(k.per.cell)
 
   if (verbose) {
     message("Computing adaptive nearest neighbors")
@@ -1115,19 +1115,20 @@ FindNeighborsQC.Seurat <- function(
     message("Building adaptive KNN graph")
   }
 
-  # Create lists to store sparse matrix triplets
-  i.list <- list()
-  j.list <- list()
+  # Pre-calculate total number of edges for efficient allocation
+  total.edges <- sum(k.per.cell)
+  i.vec <- integer(total.edges)
+  j.vec <- integer(total.edges)
 
+  # Fill vectors using cumulative indexing
+  edge.idx <- 0L
   for (cell.idx in seq_len(n.cells)) {
     k.i <- k.per.cell[cell.idx]
-    neighbors <- nn.idx.full[cell.idx, seq_len(k.i)]
-    i.list[[cell.idx]] <- rep(cell.idx, k.i)
-    j.list[[cell.idx]] <- neighbors
+    indices <- (edge.idx + 1L):(edge.idx + k.i)
+    i.vec[indices] <- cell.idx
+    j.vec[indices] <- nn.idx.full[cell.idx, seq_len(k.i)]
+    edge.idx <- edge.idx + k.i
   }
-
-  i.vec <- unlist(i.list)
-  j.vec <- unlist(j.list)
 
   nn.matrix <- sparseMatrix(
     i = i.vec,
@@ -1149,14 +1150,17 @@ FindNeighborsQC.Seurat <- function(
     }
 
     # For SNN, we need to use the trimmed neighbor rankings
-    # Create a ragged array-like structure for ComputeSNN
     # ComputeSNN expects a matrix where each row has the same number of columns
     # We'll pad shorter rows with 0s (which will be ignored in Jaccard computation)
+    # Start with full matrix and zero out excess neighbors per row
 
-    nn.ranked.adaptive <- matrix(0L, nrow = n.cells, ncol = k.global)
+    nn.ranked.adaptive <- nn.idx.full
+    # Create a mask for positions beyond k_i for each cell
     for (cell.idx in seq_len(n.cells)) {
       k.i <- k.per.cell[cell.idx]
-      nn.ranked.adaptive[cell.idx, seq_len(k.i)] <- nn.idx.full[cell.idx, seq_len(k.i)]
+      if (k.i < k.global) {
+        nn.ranked.adaptive[cell.idx, (k.i + 1L):k.global] <- 0L
+      }
     }
 
     snn.matrix <- ComputeSNN(
