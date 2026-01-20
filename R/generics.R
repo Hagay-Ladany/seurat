@@ -204,6 +204,31 @@ FindNeighbors <- function(object, ...) {
   UseMethod(generic = 'FindNeighbors', object = object)
 }
 
+#' Adaptive (QC-guided) Nearest-neighbor graph construction
+#'
+#' Computes nearest neighbors with adaptive per-cell neighbor counts based on
+#' a quality control metric. Instead of using a single fixed k.param for all
+#' cells, this function maps per-cell QC values (e.g., RNA count, number of
+#' features) to individual neighbor counts, allowing cells with higher quality
+#' to have more neighbors while limiting neighbors for lower quality cells.
+#'
+#' @param object An object
+#' @param ... Arguments passed to other methods
+#'
+#' @return This function returns a \code{\link[SeuratObject]{Seurat}} object
+#' with the adaptive KNN and SNN graphs stored in the Graphs slot with names
+#' "QC_nn" and "QC_snn" by default.
+#'
+#' @seealso \code{\link{FindNeighbors}} for standard fixed-k neighbor graph
+#' construction
+#'
+#' @rdname FindNeighborsQC
+#' @export FindNeighborsQC
+#'
+FindNeighborsQC <- function(object, ...) {
+  UseMethod(generic = 'FindNeighborsQC', object = object)
+}
+
 #' Find variable features
 #'
 #' Identifies features that are outliers on a 'mean variability plot'.

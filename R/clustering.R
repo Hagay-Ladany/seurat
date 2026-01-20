@@ -902,6 +902,295 @@ FindNeighbors.Seurat <- function(
   return(object)
 }
 
+#' @param qc.metric Name of a metadata column containing per-cell quality scores
+#' (e.g., "nFeature_RNA", "nCount_RNA"). If NULL, falls back to standard
+#' FindNeighbors behavior with fixed k.param.
+#' @param qc.mapping Optional function that maps normalized QC values (0-1) to
+#' neighbor counts. The function should accept a numeric vector of normalized
+#' QC values and return a numeric vector of the same length. If NULL, uses
+#' linear mapping: k = k.min + (k.max - k.min) * qc_normalized.
+#' @param k.min Minimum number of neighbors per cell (default: 5)
+#' @param k.max Maximum number of neighbors per cell (default: 100)
+#' @param k.param Default k parameter to use when qc.metric is NULL or invalid
+#' (default: 20)
+#' @param compute.SNN Also compute the shared nearest neighbor graph (default: TRUE)
+#' @param prune.SNN Sets the cutoff for acceptable Jaccard index when computing
+#' the neighborhood overlap for the SNN construction. Any edges with values less
+#' than or equal to this will be set to 0 and removed from the SNN graph.
+#' @param reduction Reduction to use as input for building the (S)NN
+#' @param dims Dimensions of reduction to use as input
+#' @param assay Assay to use in construction of (S)NN; used only when dims is NULL
+#' @param features Features to use as input for building the (S)NN; used only when
+#' dims is NULL
+#' @param nn.method Method for nearest neighbor finding. Options include: rann, annoy
+#' @param n.trees More trees gives higher precision when using annoy approximate
+#' nearest neighbor search
+#' @param annoy.metric Distance metric for annoy. Options include: euclidean,
+#' cosine, manhattan, and hamming
+#' @param nn.eps Error bound when performing nearest neighbor search using RANN
+#' @param l2.norm Take L2Norm of the data
+#' @param graph.name Optional naming parameter for stored (S)NN graph. Default is
+#' "QC_nn" and "QC_snn".
+#' @param verbose Whether or not to print output to the console
+#'
+#' @rdname FindNeighborsQC
+#' @export
+#' @concept clustering
+#' @method FindNeighborsQC Seurat
+#'
+#' @examples
+#' \dontrun{
+#' # Build adaptive neighbor graph using nFeature_RNA as quality metric
+#' pbmc <- FindNeighborsQC(
+#'   pbmc,
+#'   qc.metric = "nFeature_RNA",
+#'   k.min = 10,
+#'   k.max = 80,
+#'   reduction = "pca",
+#'   dims = 1:10
+#' )
+#'
+#' # Use custom QC mapping function (e.g., logarithmic scaling)
+#' log_mapping <- function(x) log1p(x * 9) / log(10)
+#' pbmc <- FindNeighborsQC(
+#'   pbmc,
+#'   qc.metric = "nFeature_RNA",
+#'   qc.mapping = log_mapping,
+#'   k.min = 10,
+#'   k.max = 80,
+#'   reduction = "pca",
+#'   dims = 1:10
+#' )
+#' }
+#'
+FindNeighborsQC.Seurat <- function(
+  object,
+  qc.metric = NULL,
+  qc.mapping = NULL,
+  k.min = 5,
+  k.max = 100,
+  k.param = 20,
+  compute.SNN = TRUE,
+  prune.SNN = 1/15,
+  reduction = "pca",
+  dims = 1:10,
+  assay = NULL,
+  features = NULL,
+  nn.method = "annoy",
+  n.trees = 50,
+  annoy.metric = "euclidean",
+  nn.eps = 0,
+  l2.norm = FALSE,
+  graph.name = NULL,
+  verbose = TRUE,
+  ...
+) {
+  CheckDots(...)
+
+  # Validate k.min and k.max
+  if (k.min < 1) {
+    stop("k.min must be at least 1")
+  }
+  if (k.max < k.min) {
+    stop("k.max must be greater than or equal to k.min")
+  }
+
+  # Fallback to standard FindNeighbors if qc.metric is NULL or invalid
+  if (is.null(x = qc.metric)) {
+    if (verbose) {
+      message("qc.metric is NULL, falling back to standard FindNeighbors with k.param = ", k.param)
+    }
+    graph.name <- graph.name %||% paste0(DefaultAssay(object = object), c("_nn", "_snn"))
+    return(FindNeighbors(
+      object = object,
+      reduction = reduction,
+      dims = dims,
+      assay = assay,
+      features = features,
+      k.param = k.param,
+      compute.SNN = compute.SNN,
+      prune.SNN = prune.SNN,
+      nn.method = nn.method,
+      n.trees = n.trees,
+      annoy.metric = annoy.metric,
+      nn.eps = nn.eps,
+      l2.norm = l2.norm,
+      graph.name = graph.name,
+      verbose = verbose,
+      ...
+    ))
+  }
+
+  # Validate qc.metric exists in metadata
+  if (!qc.metric %in% colnames(x = object[[]])) {
+    stop("qc.metric '", qc.metric, "' not found in object metadata. ",
+         "Available columns: ", paste(colnames(x = object[[]]), collapse = ", "))
+  }
+
+  # Get QC values and validate they are numeric
+  qc.values <- object[[qc.metric, drop = TRUE]]
+  if (!is.numeric(x = qc.values)) {
+    stop("qc.metric '", qc.metric, "' must be numeric. Found type: ", class(qc.values))
+  }
+
+  # Get data for neighbor computation
+  if (!is.null(x = dims)) {
+    assay <- DefaultAssay(object = object[[reduction]])
+    data.use <- Embeddings(object = object[[reduction]])
+    if (max(dims) > ncol(x = data.use)) {
+      stop("More dimensions specified in dims than have been computed")
+    }
+    data.use <- data.use[, dims]
+  } else {
+    assay <- assay %||% DefaultAssay(object = object)
+    features <- features %||% VariableFeatures(object = object[[assay]])
+    data.use <- t(x = GetAssayData(object = object[[assay]], layer = "data")[features, ])
+  }
+
+  n.cells <- nrow(x = data.use)
+
+  # Normalize QC values to [0, 1]
+  qc.range <- range(qc.values, na.rm = TRUE)
+  if (qc.range[1] == qc.range[2]) {
+    # All values are the same, use middle k
+    qc.normalized <- rep(0.5, length(qc.values))
+    if (verbose) {
+      message("All QC values are identical, using k = ", round((k.min + k.max) / 2))
+    }
+  } else {
+    qc.normalized <- (qc.values - qc.range[1]) / (qc.range[2] - qc.range[1])
+  }
+
+  # Apply QC mapping function
+  if (!is.null(x = qc.mapping)) {
+    if (!is.function(x = qc.mapping)) {
+      stop("qc.mapping must be a function")
+    }
+    qc.mapped <- qc.mapping(qc.normalized)
+    if (length(qc.mapped) != length(qc.normalized)) {
+      stop("qc.mapping function must return a vector of the same length as input")
+    }
+    # Ensure mapped values are in [0, 1]
+    qc.mapped <- pmin(pmax(qc.mapped, 0), 1)
+  } else {
+    # Default linear mapping
+    qc.mapped <- qc.normalized
+  }
+
+  # Compute per-cell k values
+  k.per.cell <- round(k.min + (k.max - k.min) * qc.mapped)
+
+  # Enforce bounds: k_i >= 1 and k_i <= n.cells - 1
+  k.per.cell <- pmin(pmax(k.per.cell, 1), n.cells - 1)
+
+  # Also enforce k.max doesn't exceed n.cells - 1
+  k.global <- min(max(k.per.cell), n.cells - 1)
+
+  if (verbose) {
+    message("Computing adaptive nearest neighbors")
+    message("  k range: ", min(k.per.cell), " - ", max(k.per.cell))
+    message("  Using k.global = ", k.global, " for initial search")
+  }
+
+  if (l2.norm) {
+    data.use <- L2Norm(mat = data.use)
+  }
+
+  # Compute full neighbor graph with k.global
+  nn.full <- NNHelper(
+    data = data.use,
+    query = data.use,
+    k = k.global,
+    method = nn.method,
+    n.trees = n.trees,
+    searchtype = "standard",
+    eps = nn.eps,
+    metric = annoy.metric
+  )
+
+  nn.idx.full <- Indices(object = nn.full)
+
+  # Build sparse adjacency matrix with per-cell k values
+  if (verbose) {
+    message("Building adaptive KNN graph")
+  }
+
+  # Create lists to store sparse matrix triplets
+  i.list <- list()
+  j.list <- list()
+
+  for (cell.idx in seq_len(n.cells)) {
+    k.i <- k.per.cell[cell.idx]
+    neighbors <- nn.idx.full[cell.idx, seq_len(k.i)]
+    i.list[[cell.idx]] <- rep(cell.idx, k.i)
+    j.list[[cell.idx]] <- neighbors
+  }
+
+  i.vec <- unlist(i.list)
+  j.vec <- unlist(j.list)
+
+  nn.matrix <- sparseMatrix(
+    i = i.vec,
+    j = j.vec,
+    x = 1,
+    dims = c(n.cells, n.cells)
+  )
+  rownames(x = nn.matrix) <- rownames(x = data.use)
+  colnames(x = nn.matrix) <- rownames(x = data.use)
+  nn.matrix <- as.Graph(x = nn.matrix)
+  DefaultAssay(object = nn.matrix) <- assay
+
+  # Build SNN graph if requested
+  neighbor.graphs <- list(nn = nn.matrix)
+
+  if (compute.SNN) {
+    if (verbose) {
+      message("Computing adaptive SNN")
+    }
+
+    # For SNN, we need to use the trimmed neighbor rankings
+    # Create a ragged array-like structure for ComputeSNN
+    # ComputeSNN expects a matrix where each row has the same number of columns
+    # We'll pad shorter rows with 0s (which will be ignored in Jaccard computation)
+
+    nn.ranked.adaptive <- matrix(0L, nrow = n.cells, ncol = k.global)
+    for (cell.idx in seq_len(n.cells)) {
+      k.i <- k.per.cell[cell.idx]
+      nn.ranked.adaptive[cell.idx, seq_len(k.i)] <- nn.idx.full[cell.idx, seq_len(k.i)]
+    }
+
+    snn.matrix <- ComputeSNN(
+      nn_ranked = nn.ranked.adaptive,
+      prune = prune.SNN
+    )
+    rownames(x = snn.matrix) <- rownames(x = data.use)
+    colnames(x = snn.matrix) <- rownames(x = data.use)
+    snn.matrix <- as.Graph(x = snn.matrix)
+    DefaultAssay(object = snn.matrix) <- assay
+    neighbor.graphs[["snn"]] <- snn.matrix
+  }
+
+  # Set default graph names
+  graph.name <- graph.name %||% c("QC_nn", "QC_snn")
+
+  if (length(x = graph.name) == 1) {
+    if (verbose) {
+      message("Only one graph name supplied, storing nearest-neighbor graph only")
+    }
+  }
+
+  # Store graphs in object
+  for (ii in seq_len(min(length(x = graph.name), length(x = neighbor.graphs)))) {
+    object[[graph.name[[ii]]]] <- neighbor.graphs[[ii]]
+  }
+
+  # Store k.per.cell in metadata for reference
+  object[[paste0(qc.metric, "_k")]] <- k.per.cell
+
+  object <- LogSeuratCommand(object = object)
+  return(object)
+}
+
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 # Internal
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
